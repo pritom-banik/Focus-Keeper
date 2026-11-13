@@ -1011,61 +1011,145 @@ async function hydrateFocusSearch() {
 
 // ── VIDEO FILTERING ───────────────────────────────────────────────────────────
 
+// YouTube is a single-page app: moving to another video does not reload the
+// page, and <meta name="title"> keeps the first video's title. So the title is
+// read fresh every time, preferring the watch-page heading, which YouTube
+// updates on navigation.
 function getYouTubeVideoTitle() {
+  const heading = document.querySelector("ytd-watch-metadata h1");
+  const fromHeading = heading ? heading.textContent.trim() : "";
+  if (fromHeading) return fromHeading;
+
+  const fromPageTitle = document.title
+    .replace(/^\(\d+\)\s*/, "")          // notification count, e.g. "(3) "
+    .replace(/\s*-\s*YouTube\s*$/, "")
+    .trim();
+  if (fromPageTitle && fromPageTitle !== "YouTube") return fromPageTitle;
+
   const metaTitle = document.querySelector('meta[name="title"]');
   return metaTitle ? metaTitle.content : null;
 }
 
-const videoTitle = getYouTubeVideoTitle();
-console.log("YouTube Video Title:", videoTitle);
+// The video the filter is currently comparing suggestions against.
+const filterState = {
+  videoId: null,       // ?v= of the current watch page
+  mainTitle: null,     // its title, once the page shows it
+  previousTitle: null, // title of the video we navigated away from
+  navigatedAt: 0,
+};
 
-//chrome.runtime.sendMessage({ type: "VIDEO_TITLE", title: videoTitle });
+// After navigation the heading can still show the previous video's title for a
+// moment. Wait until it changes, but not forever, in case two consecutive
+// videos really do have the same title.
+const TITLE_SETTLE_TIMEOUT_MS = 3000;
+
+function unhideFilteredSuggestions() {
+  filteredElements.forEach((_, dom) => {
+    dom.style.transition = "";
+    dom.style.transform = "";
+    dom.style.opacity = "";
+    dom.style.display = "";
+  });
+  filteredElements.clear();
+}
+
+// Returns the title to compare against, or null if we are not on a watch page
+// or the new video's title has not appeared yet.
+function getFilterMainTitle() {
+  const videoId = getCurrentVideoId();
+  if (!videoId) return null;
+
+  if (videoId !== filterState.videoId) {
+    // New video: forget earlier decisions and bring back anything hidden for
+    // the previous video (YouTube reuses the same sidebar elements).
+    unhideFilteredSuggestions();
+    videoInfo = [];
+    filterState.previousTitle = filterState.mainTitle;
+    filterState.videoId = videoId;
+    filterState.mainTitle = null;
+    filterState.navigatedAt = Date.now();
+  }
+
+  if (!filterState.mainTitle) {
+    const title = getYouTubeVideoTitle();
+    if (!title) return null;
+    const stillOldTitle =
+      title === filterState.previousTitle &&
+      Date.now() - filterState.navigatedAt < TITLE_SETTLE_TIMEOUT_MS;
+    if (stillOldTitle) return null;
+    filterState.mainTitle = title;
+  }
+
+  return filterState.mainTitle;
+}
+
+function extractTitle(video) {
+  const titleLink = video.querySelector("a.ytLockupMetadataViewModelTitle");
+  return titleLink
+    ? (titleLink.getAttribute("title") || titleLink.innerText.trim())
+    : null;
+}
 
 function extractVideoInfo() {
   const videos = document.querySelectorAll("yt-lockup-view-model");
   return [...videos].map((video) => {
     const titleLink = video.querySelector("a.ytLockupMetadataViewModelTitle");
-    const titleText = titleLink
-      ? (titleLink.getAttribute("title") || titleLink.innerText.trim())
-      : null;
     return {
       dom: video,
-      title: titleText,
+      title: extractTitle(video),
       link: titleLink ? titleLink.href : null
     };
   });
 }
 
 function filterExistingVideos() {
-  if (filterEnabled) {
-    const allVideoInfo = extractVideoInfo();
+  if (!filterEnabled) return;
 
-    allVideoInfo.forEach((element) => {
-      if (element.title && !videoInfo.includes(element.title)) {
-        videoInfo.push(element.title);
+  const mainTitle = getFilterMainTitle();
+  if (!mainTitle) return;
+  const requestVideoId = filterState.videoId;
 
-        console.log(element.title);
-        chrome.runtime.sendMessage(
-          {
-            type: "NEW_VIDEO",
-            video_title: videoTitle,
-            title: element.title
-          },
-          (response) => {
-            const keepVideo = response?.result;
-            if (keepVideo === false) {
-              const el = element.dom;
-              el.style.transition = "transform 1s ease, opacity 1s ease";
-              el.style.transform = "translateX(100%)";
-              el.style.opacity = "0";
-              setTimeout(() => { el.style.display = "none"; }, 400);
-              filteredElements.set(element.dom, true);
-            }
-          },
-        );
-      }
-    });
-  }
+  extractVideoInfo().forEach((element) => {
+    if (!element.title) return;
+
+    // YouTube can reuse a hidden card for a different suggestion; show it
+    // again so the new title gets its own decision.
+    const hiddenFor = filteredElements.get(element.dom);
+    if (hiddenFor !== undefined && hiddenFor !== element.title) {
+      const el = element.dom;
+      el.style.transition = "";
+      el.style.transform = "";
+      el.style.opacity = "";
+      el.style.display = "";
+      filteredElements.delete(el);
+    }
+
+    if (videoInfo.includes(element.title)) return;
+    videoInfo.push(element.title);
+
+    chrome.runtime.sendMessage(
+      {
+        type: "NEW_VIDEO",
+        video_title: mainTitle,
+        title: element.title,
+      },
+      (response) => {
+        // Ignore answers that arrive after the user has moved to another video.
+        if (filterState.videoId !== requestVideoId) return;
+        if (response?.result !== false) return;
+
+        const el = element.dom;
+        // The card may have been reused for another suggestion meanwhile.
+        if (extractTitle(el) !== element.title) return;
+
+        el.style.transition = "transform 1s ease, opacity 1s ease";
+        el.style.transform = "translateX(100%)";
+        el.style.opacity = "0";
+        setTimeout(() => { el.style.display = "none"; }, 400);
+        filteredElements.set(el, element.title);
+      },
+    );
+  });
 }
 
 const observer = new MutationObserver(() => {
@@ -1076,7 +1160,8 @@ const observer = new MutationObserver(() => {
 observer.observe(document.body, { childList: true, subtree: true });
 
 document.addEventListener("yt-navigate-finish", () => {
-  videoInfo = [];
+  // Filter state is reset in getFilterMainTitle() when the video ID changes.
+  filterExistingVideos();
   hydrateContentControls().catch((error) => console.error("Control sync failed:", error));
   if (noteApp?.root?.classList.contains("is-open")) {
     loadNotesIntoEditor().catch((error) => console.error("Failed to reload notes:", error));
@@ -1171,8 +1256,6 @@ function getCurrentVideoId() {
 }
 
 function getCurrentVideoTitle() {
-  const fromPageTitle = document.title.replace(/\s*-\s*YouTube\s*$/, "").trim();
-  if (fromPageTitle && fromPageTitle !== "YouTube") return fromPageTitle;
   return getYouTubeVideoTitle() || "Untitled video";
 }
 
